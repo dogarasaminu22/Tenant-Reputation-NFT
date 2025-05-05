@@ -93,3 +93,96 @@
         (nft-transfer? tenant-rep token-id sender recipient)
     )
 )
+
+
+
+(define-public (burn (token-id uint) (sender principal))
+    (begin
+        (asserts! (is-eq tx-sender sender) err-not-authorized)
+        (nft-burn? tenant-rep token-id sender)
+    )
+)
+(define-public (get-landlord (token-id uint))
+    (ok (get landlord (map-get? tenant-records token-id)))
+)
+(define-public (get-property-address (token-id uint))
+    (ok (get property-address (map-get? tenant-records token-id)))
+)
+(define-public (get-start-date (token-id uint))
+    (ok (get start-date (map-get? tenant-records token-id)))
+)
+(define-public (get-end-date (token-id uint))
+    (ok (get end-date (map-get? tenant-records token-id)))
+)
+(define-public (get-rating (token-id uint))
+    (ok (get rating (map-get? tenant-records token-id)))
+)
+
+
+(define-map disputed-records 
+    uint 
+    {
+        is-disputed: bool,
+        dispute-reason: (string-ascii 200),
+        dispute-date: uint
+    }
+)
+
+(define-constant DISPUTE-WINDOW u604800)
+
+(define-public (dispute-rating 
+    (token-id uint) 
+    (reason (string-ascii 200)))
+    (let (
+        (record (unwrap! (map-get? tenant-records token-id) err-not-found))
+        (current-time stacks-block-height)
+    )
+        (asserts! (is-eq tx-sender (get tenant record)) err-not-authorized)
+        (asserts! (< (- current-time (get end-date record)) DISPUTE-WINDOW) (err u104))
+        (ok (map-set disputed-records token-id {
+            is-disputed: true,
+            dispute-reason: reason,
+            dispute-date: current-time
+        }))
+    )
+)
+
+(define-read-only (get-dispute-status (token-id uint))
+    (ok (map-get? disputed-records token-id))
+)
+
+
+(define-map tenant-stats
+    principal
+    {
+        total-ratings: uint,
+        average-rating: uint,
+        total-properties: uint
+    }
+)
+
+(define-public (calculate-tenant-stats (tenant principal))
+    (let (
+        (history (unwrap! (map-get? tenant-history tenant) err-not-found))
+        (ratings-sum (fold + (map get-rating-for-token history) u0))
+        (total-props (len history))
+    )
+        (asserts! (> total-props u0) err-not-found)
+        (ok (map-set tenant-stats tenant {
+            total-ratings: ratings-sum,
+            average-rating: (/ ratings-sum total-props),
+            total-properties: total-props
+        }))
+    )
+)
+
+(define-private (get-rating-for-token (token-id uint))
+    (match (map-get? tenant-records token-id)
+        record (get rating record)
+        u0
+    )
+)
+
+(define-read-only (get-tenant-stats (tenant principal))
+    (ok (map-get? tenant-stats tenant))
+)
