@@ -1,4 +1,3 @@
-;; (impl-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
 
 (define-non-fungible-token tenant-rep uint)
 
@@ -25,6 +24,46 @@
     principal 
     (list 10 uint)
 )
+
+
+(define-map landlord-ratings
+    uint
+    {
+        rater: principal,
+        landlord: principal,
+        property-address: (string-ascii 100),
+        responsiveness-rating: uint,
+        maintenance-rating: uint,
+        communication-rating: uint,
+        overall-rating: uint,
+        review: (string-ascii 500),
+        rating-date: uint
+    }
+)
+
+(define-map landlord-rating-history
+    principal
+    (list 50 uint)
+)
+
+(define-map landlord-reputation
+    principal
+    {
+        total-ratings: uint,
+        average-responsiveness: uint,
+        average-maintenance: uint,
+        average-communication: uint,
+        overall-average: uint,
+        total-properties-managed: uint
+    }
+)
+
+(define-data-var last-rating-id uint u0)
+
+(define-constant err-invalid-rating (err u200))
+(define-constant err-already-rated (err u201))
+(define-constant err-not-tenant (err u202))
+(define-constant err-rating-not-found (err u203))
 
 (define-data-var last-token-id uint u0)
 
@@ -185,4 +224,136 @@
 
 (define-read-only (get-tenant-stats (tenant principal))
     (ok (map-get? tenant-stats tenant))
+)
+
+
+(define-public (rate-landlord
+    (landlord principal)
+    (property-address (string-ascii 100))
+    (responsiveness-rating uint)
+    (maintenance-rating uint)
+    (communication-rating uint)
+    (review (string-ascii 500)))
+    (let
+        ((new-rating-id (+ (var-get last-rating-id) u1))
+         (overall-rating (/ (+ responsiveness-rating maintenance-rating communication-rating) u3)))
+        
+        (asserts! (<= responsiveness-rating u5) err-invalid-rating)
+        (asserts! (<= maintenance-rating u5) err-invalid-rating)
+        (asserts! (<= communication-rating u5) err-invalid-rating)
+        (asserts! (> responsiveness-rating u0) err-invalid-rating)
+        (asserts! (> maintenance-rating u0) err-invalid-rating)
+        (asserts! (> communication-rating u0) err-invalid-rating)
+        
+        (map-set landlord-ratings new-rating-id
+            {
+                rater: tx-sender,
+                landlord: landlord,
+                property-address: property-address,
+                responsiveness-rating: responsiveness-rating,
+                maintenance-rating: maintenance-rating,
+                communication-rating: communication-rating,
+                overall-rating: overall-rating,
+                review: review,
+                rating-date: stacks-block-height
+            }
+        )
+        
+        (var-set last-rating-id new-rating-id)
+        
+        (match (map-get? landlord-rating-history landlord)
+            prev-history (map-set landlord-rating-history landlord 
+                (unwrap-panic (as-max-len? (concat prev-history (list new-rating-id)) u50)))
+            (map-set landlord-rating-history landlord (list new-rating-id))
+        )
+        
+        (try! (update-landlord-reputation landlord))
+        (ok new-rating-id)
+    )
+)
+
+(define-public (update-landlord-reputation (landlord principal))
+    (let
+        ((rating-history (unwrap! (map-get? landlord-rating-history landlord) err-rating-not-found))
+         (total-ratings (len rating-history))
+         (responsiveness-sum (fold + (map get-responsiveness-rating rating-history) u0))
+         (maintenance-sum (fold + (map get-maintenance-rating rating-history) u0))
+         (communication-sum (fold + (map get-communication-rating rating-history) u0))
+         (overall-sum (fold + (map get-overall-rating rating-history) u0)))
+        
+        (asserts! (> total-ratings u0) err-rating-not-found)
+        
+        (ok (map-set landlord-reputation landlord
+            {
+                total-ratings: total-ratings,
+                average-responsiveness: (/ responsiveness-sum total-ratings),
+                average-maintenance: (/ maintenance-sum total-ratings),
+                average-communication: (/ communication-sum total-ratings),
+                overall-average: (/ overall-sum total-ratings),
+                total-properties-managed: total-ratings
+            }
+        ))
+    )
+)
+
+(define-private (get-responsiveness-rating (rating-id uint))
+    (match (map-get? landlord-ratings rating-id)
+        rating (get responsiveness-rating rating)
+        u0
+    )
+)
+
+(define-private (get-maintenance-rating (rating-id uint))
+    (match (map-get? landlord-ratings rating-id)
+        rating (get maintenance-rating rating)
+        u0
+    )
+)
+
+(define-private (get-communication-rating (rating-id uint))
+    (match (map-get? landlord-ratings rating-id)
+        rating (get communication-rating rating)
+        u0
+    )
+)
+
+(define-private (get-overall-rating (rating-id uint))
+    (match (map-get? landlord-ratings rating-id)
+        rating (get overall-rating rating)
+        u0
+    )
+)
+
+(define-read-only (get-landlord-rating (rating-id uint))
+    (ok (map-get? landlord-ratings rating-id))
+)
+
+(define-read-only (get-landlord-reputation (landlord principal))
+    (ok (map-get? landlord-reputation landlord))
+)
+
+(define-read-only (get-landlord-rating-history (landlord principal))
+    (ok (map-get? landlord-rating-history landlord))
+)
+
+(define-read-only (get-landlord-reviews (landlord principal))
+    (let
+        ((rating-history (default-to (list) (map-get? landlord-rating-history landlord))))
+        (ok (map get-rating-details rating-history))
+    )
+)
+
+(define-private (get-rating-details (rating-id uint))
+    (map-get? landlord-ratings rating-id)
+)
+
+(define-read-only (is-landlord-highly-rated (landlord principal))
+    (match (map-get? landlord-reputation landlord)
+        reputation (ok (and (>= (get overall-average reputation) u4) (>= (get total-ratings reputation) u3)))
+        (ok false)
+    )
+)
+
+(define-read-only (get-last-rating-id)
+    (ok (var-get last-rating-id))
 )
