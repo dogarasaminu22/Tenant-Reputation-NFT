@@ -6,6 +6,79 @@
 (define-constant err-not-found (err u101))
 (define-constant err-already-exists (err u102))
 
+
+(define-constant ESCROW-TIMEOUT u4320)
+(define-constant DISPUTE-RESOLUTION-PERIOD u2880)
+(define-constant PENALTY-RATE u5)
+
+(define-map escrow-agreements
+    uint
+    {
+        tenant: principal,
+        landlord: principal,
+        property-address: (string-ascii 100),
+        monthly-rent: uint,
+        deposit-amount: uint,
+        start-date: uint,
+        end-date: uint,
+        payment-frequency: uint,
+        total-escrowed: uint,
+        status: (string-ascii 20),
+        next-payment-due: uint,
+        dispute-status: (string-ascii 20),
+        dispute-raised-date: uint,
+        auto-release-enabled: bool
+    }
+)
+
+(define-map escrow-balances
+    uint
+    {
+        tenant-balance: uint,
+        landlord-balance: uint,
+        pending-release: uint,
+        penalty-pool: uint
+    }
+)
+
+(define-map payment-history
+    uint
+    (list 50 {
+        payment-date: uint,
+        amount: uint,
+        payment-type: (string-ascii 20),
+        released-date: uint,
+        status: (string-ascii 20)
+    })
+)
+
+(define-map escrow-disputes
+    uint
+    {
+        dispute-id: uint,
+        disputed-amount: uint,
+        reason: (string-ascii 300),
+        evidence: (string-ascii 500),
+        resolution-deadline: uint,
+        arbitrator: (optional principal),
+        resolution: (optional (string-ascii 300))
+    }
+)
+
+(define-data-var last-escrow-id uint u0)
+(define-data-var last-dispute-id uint u0)
+(define-data-var platform-fee-rate uint u250)
+
+(define-constant err-escrow-not-found (err u300))
+(define-constant err-insufficient-funds (err u301))
+(define-constant err-escrow-expired (err u302))
+(define-constant err-payment-overdue (err u303))
+(define-constant err-dispute-active (err u304))
+(define-constant err-invalid-amount (err u305))
+(define-constant err-escrow-closed (err u306))
+(define-constant err-unauthorized-party (err u307))
+(define-constant err-dispute-expired (err u308))
+
 (define-map tenant-records
     uint 
     {
@@ -356,4 +429,379 @@
 
 (define-read-only (get-last-rating-id)
     (ok (var-get last-rating-id))
+)
+
+
+(define-public (create-escrow-agreement
+    (tenant principal)
+    (property-address (string-ascii 100))
+    (monthly-rent uint)
+    (deposit-amount uint)
+    (lease-duration uint)
+    (payment-frequency uint))
+    (let
+        ((new-escrow-id (+ (var-get last-escrow-id) u1))
+         (current-time stacks-block-height)
+         (end-date (+ current-time lease-duration)))
+        
+        (asserts! (is-some (map-get? landlords tx-sender)) err-not-authorized)
+        (asserts! (> monthly-rent u0) err-invalid-amount)
+        (asserts! (> deposit-amount u0) err-invalid-amount)
+        (asserts! (> lease-duration u0) err-invalid-amount)
+        (asserts! (> payment-frequency u0) err-invalid-amount)
+        
+        (map-set escrow-agreements new-escrow-id
+            {
+                tenant: tenant,
+                landlord: tx-sender,
+                property-address: property-address,
+                monthly-rent: monthly-rent,
+                deposit-amount: deposit-amount,
+                start-date: current-time,
+                end-date: end-date,
+                payment-frequency: payment-frequency,
+                total-escrowed: u0,
+                status: "active",
+                next-payment-due: (+ current-time payment-frequency),
+                dispute-status: "none",
+                dispute-raised-date: u0,
+                auto-release-enabled: true
+            }
+        )
+        
+        (map-set escrow-balances new-escrow-id
+            {
+                tenant-balance: u0,
+                landlord-balance: u0,
+                pending-release: u0,
+                penalty-pool: u0
+            }
+        )
+        
+        (map-set payment-history new-escrow-id (list))
+        
+        (var-set last-escrow-id new-escrow-id)
+        (ok new-escrow-id)
+    )
+)
+
+(define-public (deposit-to-escrow (escrow-id uint) (amount uint))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (balance (unwrap! (map-get? escrow-balances escrow-id) err-escrow-not-found))
+         (current-time stacks-block-height))
+        
+        (asserts! (is-eq tx-sender (get tenant escrow)) err-unauthorized-party)
+        (asserts! (is-eq (get status escrow) "active") err-escrow-closed)
+        (asserts! (> amount u0) err-invalid-amount)
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (map-set escrow-balances escrow-id
+            (merge balance {
+                tenant-balance: (+ (get tenant-balance balance) amount)
+            })
+        )
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {
+                total-escrowed: (+ (get total-escrowed escrow) amount)
+            })
+        )
+        
+        (let
+            ((current-history (default-to (list) (map-get? payment-history escrow-id)))
+             (new-payment {
+                payment-date: current-time,
+                amount: amount,
+                payment-type: "deposit",
+                released-date: u0,
+                status: "escrowed"
+             }))
+            
+            (map-set payment-history escrow-id
+                (unwrap-panic (as-max-len? (concat current-history (list new-payment)) u50))
+            )
+        )
+        
+        (ok amount)
+    )
+)
+
+(define-public (process-monthly-payment (escrow-id uint))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (balance (unwrap! (map-get? escrow-balances escrow-id) err-escrow-not-found))
+         (current-time stacks-block-height)
+         (monthly-rent (get monthly-rent escrow))
+         (payment-due-date (get next-payment-due escrow)))
+        
+        (asserts! (is-eq (get status escrow) "active") err-escrow-closed)
+        (asserts! (>= (get tenant-balance balance) monthly-rent) err-insufficient-funds)
+        (asserts! (>= current-time payment-due-date) err-payment-overdue)
+        
+        (let
+            ((platform-fee (/ (* monthly-rent (var-get platform-fee-rate)) u10000))
+             (net-payment (- monthly-rent platform-fee)))
+            
+            (map-set escrow-balances escrow-id
+                (merge balance {
+                    tenant-balance: (- (get tenant-balance balance) monthly-rent),
+                    pending-release: (+ (get pending-release balance) net-payment)
+                })
+            )
+            
+            (map-set escrow-agreements escrow-id
+                (merge escrow {
+                    next-payment-due: (+ payment-due-date (get payment-frequency escrow))
+                })
+            )
+            
+            (let
+                ((current-history (default-to (list) (map-get? payment-history escrow-id)))
+                 (new-payment {
+                    payment-date: current-time,
+                    amount: monthly-rent,
+                    payment-type: "monthly-rent",
+                    released-date: u0,
+                    status: "pending-release"
+                 }))
+                
+                (map-set payment-history escrow-id
+                    (unwrap-panic (as-max-len? (concat current-history (list new-payment)) u50))
+                )
+            )
+            
+            (ok net-payment)
+        )
+    )
+)
+
+(define-public (release-payment (escrow-id uint))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (balance (unwrap! (map-get? escrow-balances escrow-id) err-escrow-not-found))
+         (current-time stacks-block-height)
+         (pending-amount (get pending-release balance)))
+        
+        (asserts! (or (is-eq tx-sender (get landlord escrow)) (is-eq tx-sender (get tenant escrow))) err-unauthorized-party)
+        (asserts! (is-eq (get dispute-status escrow) "none") err-dispute-active)
+        (asserts! (> pending-amount u0) err-insufficient-funds)
+        
+        (try! (as-contract (stx-transfer? pending-amount tx-sender (get landlord escrow))))
+        
+        (map-set escrow-balances escrow-id
+            (merge balance {
+                pending-release: u0,
+                landlord-balance: (+ (get landlord-balance balance) pending-amount)
+            })
+        )
+        
+        (ok pending-amount)
+    )
+)
+
+(define-public (auto-release-payment (escrow-id uint))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (balance (unwrap! (map-get? escrow-balances escrow-id) err-escrow-not-found))
+         (current-time stacks-block-height)
+         (pending-amount (get pending-release balance)))
+        
+        (asserts! (get auto-release-enabled escrow) err-not-authorized)
+        (asserts! (is-eq (get dispute-status escrow) "none") err-dispute-active)
+        (asserts! (> pending-amount u0) err-insufficient-funds)
+        (asserts! (>= current-time (+ (get next-payment-due escrow) ESCROW-TIMEOUT)) err-escrow-expired)
+        
+        (try! (as-contract (stx-transfer? pending-amount tx-sender (get landlord escrow))))
+        
+        (map-set escrow-balances escrow-id
+            (merge balance {
+                pending-release: u0,
+                landlord-balance: (+ (get landlord-balance balance) pending-amount)
+            })
+        )
+        
+        (ok pending-amount)
+    )
+)
+
+(define-public (raise-payment-dispute
+    (escrow-id uint)
+    (disputed-amount uint)
+    (reason (string-ascii 300))
+    (evidence (string-ascii 500)))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (new-dispute-id (+ (var-get last-dispute-id) u1))
+         (current-time stacks-block-height)
+         (resolution-deadline (+ current-time DISPUTE-RESOLUTION-PERIOD)))
+        
+        (asserts! (or (is-eq tx-sender (get tenant escrow)) (is-eq tx-sender (get landlord escrow))) err-unauthorized-party)
+        (asserts! (is-eq (get dispute-status escrow) "none") err-dispute-active)
+        (asserts! (> disputed-amount u0) err-invalid-amount)
+        
+        (map-set escrow-disputes escrow-id
+            {
+                dispute-id: new-dispute-id,
+                disputed-amount: disputed-amount,
+                reason: reason,
+                evidence: evidence,
+                resolution-deadline: resolution-deadline,
+                arbitrator: none,
+                resolution: none
+            }
+        )
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {
+                dispute-status: "active",
+                dispute-raised-date: current-time,
+                auto-release-enabled: false
+            })
+        )
+        
+        (var-set last-dispute-id new-dispute-id)
+        (ok new-dispute-id)
+    )
+)
+
+(define-public (resolve-dispute
+    (escrow-id uint)
+    (tenant-award uint)
+    (landlord-award uint)
+    (resolution-note (string-ascii 300)))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (dispute (unwrap! (map-get? escrow-disputes escrow-id) err-escrow-not-found))
+         (balance (unwrap! (map-get? escrow-balances escrow-id) err-escrow-not-found))
+         (current-time stacks-block-height))
+        
+        (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+        (asserts! (is-eq (get dispute-status escrow) "active") err-dispute-active)
+        (asserts! (<= current-time (get resolution-deadline dispute)) err-dispute-expired)
+        
+        (if (> tenant-award u0)
+            (try! (as-contract (stx-transfer? tenant-award tx-sender (get tenant escrow))))
+            true
+        )
+        
+        (if (> landlord-award u0)
+            (try! (as-contract (stx-transfer? landlord-award tx-sender (get landlord escrow))))
+            true
+        )
+        
+        (map-set escrow-disputes escrow-id
+            (merge dispute {
+                arbitrator: (some tx-sender),
+                resolution: (some resolution-note)
+            })
+        )
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {
+                dispute-status: "resolved",
+                auto-release-enabled: true
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (close-escrow-agreement (escrow-id uint))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (balance (unwrap! (map-get? escrow-balances escrow-id) err-escrow-not-found))
+         (current-time stacks-block-height))
+        
+        (asserts! (or (is-eq tx-sender (get landlord escrow)) (is-eq tx-sender (get tenant escrow))) err-unauthorized-party)
+        (asserts! (>= current-time (get end-date escrow)) err-escrow-expired)
+        (asserts! (is-eq (get dispute-status escrow) "none") err-dispute-active)
+        
+        (let
+            ((remaining-tenant-balance (get tenant-balance balance))
+             (remaining-pending (get pending-release balance)))
+            
+            (if (> remaining-tenant-balance u0)
+                (try! (as-contract (stx-transfer? remaining-tenant-balance tx-sender (get tenant escrow))))
+                true
+            )
+            
+            (if (> remaining-pending u0)
+                (try! (as-contract (stx-transfer? remaining-pending tx-sender (get landlord escrow))))
+                true
+            )
+        )
+        
+        (map-set escrow-agreements escrow-id
+            (merge escrow {
+                status: "closed"
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (apply-late-payment-penalty (escrow-id uint))
+    (let
+        ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+         (balance (unwrap! (map-get? escrow-balances escrow-id) err-escrow-not-found))
+         (current-time stacks-block-height)
+         (overdue-days (/ (- current-time (get next-payment-due escrow)) u144))
+         (penalty-amount (/ (* (get monthly-rent escrow) PENALTY-RATE overdue-days) u100)))
+        
+        (asserts! (is-eq tx-sender (get landlord escrow)) err-unauthorized-party)
+        (asserts! (> overdue-days u0) err-not-authorized)
+        (asserts! (>= (get tenant-balance balance) penalty-amount) err-insufficient-funds)
+        
+        (map-set escrow-balances escrow-id
+            (merge balance {
+                tenant-balance: (- (get tenant-balance balance) penalty-amount),
+                penalty-pool: (+ (get penalty-pool balance) penalty-amount)
+            })
+        )
+        
+        (ok penalty-amount)
+    )
+)
+
+(define-read-only (get-escrow-agreement (escrow-id uint))
+    (ok (map-get? escrow-agreements escrow-id))
+)
+
+(define-read-only (get-escrow-balance (escrow-id uint))
+    (ok (map-get? escrow-balances escrow-id))
+)
+
+(define-read-only (get-payment-history (escrow-id uint))
+    (ok (map-get? payment-history escrow-id))
+)
+
+(define-read-only (get-escrow-dispute (escrow-id uint))
+    (ok (map-get? escrow-disputes escrow-id))
+)
+
+(define-read-only (get-last-escrow-id)
+    (ok (var-get last-escrow-id))
+)
+
+(define-read-only (is-payment-overdue (escrow-id uint))
+    (match (map-get? escrow-agreements escrow-id)
+        escrow (ok (> stacks-block-height (get next-payment-due escrow)))
+        (ok false)
+    )
+)
+
+(define-read-only (calculate-escrow-utilization (escrow-id uint))
+    (match (map-get? escrow-balances escrow-id)
+        balance (let
+            ((total-balance (+ (get tenant-balance balance) (get landlord-balance balance) (get pending-release balance)))
+             (escrow-data (unwrap-panic (map-get? escrow-agreements escrow-id)))
+             (required-balance (+ (get monthly-rent escrow-data) (get deposit-amount escrow-data))))
+            (ok (/ (* total-balance u100) required-balance))
+        )
+        (ok u0)
+    )
 )
