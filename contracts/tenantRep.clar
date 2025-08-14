@@ -805,3 +805,385 @@
         (ok u0)
     )
 )
+
+;; ===== PROPERTY INSURANCE & DAMAGE CLAIMS SYSTEM =====
+
+;; Constants for insurance system
+(define-constant CLAIM-REVIEW-PERIOD u2016) ;; 14 days in blocks
+(define-constant MAX-CLAIM-AMOUNT u1000000) ;; 1M STX maximum claim
+(define-constant INSURANCE-FEE-RATE u500) ;; 5% fee rate
+
+;; Error constants for insurance
+(define-constant err-insurance-not-found (err u400))
+(define-constant err-claim-not-found (err u401))
+(define-constant err-invalid-claim-amount (err u402))
+(define-constant err-claim-expired (err u403))
+(define-constant err-insurance-expired (err u404))
+(define-constant err-claim-already-processed (err u405))
+(define-constant err-insufficient-coverage (err u406))
+(define-constant err-unauthorized-adjuster (err u407))
+
+;; Data variables for insurance system
+(define-data-var last-insurance-id uint u0)
+(define-data-var last-claim-id uint u0)
+
+;; Insurance policy data structure
+(define-map property-insurance-policies
+    uint
+    {
+        policy-holder: principal,
+        property-address: (string-ascii 100),
+        coverage-amount: uint,
+        premium-amount: uint,
+        policy-start: uint,
+        policy-end: uint,
+        status: (string-ascii 20),
+        coverage-type: (string-ascii 50),
+        deductible: uint,
+        total-claims-paid: uint
+    }
+)
+
+;; Insurance claims data structure
+(define-map damage-claims
+    uint
+    {
+        claim-id: uint,
+        policy-id: uint,
+        claimant: principal,
+        damage-description: (string-ascii 500),
+        claimed-amount: uint,
+        evidence-hash: (string-ascii 64),
+        claim-date: uint,
+        review-deadline: uint,
+        adjuster: (optional principal),
+        approved-amount: uint,
+        claim-status: (string-ascii 20),
+        resolution-notes: (string-ascii 300)
+    }
+)
+
+;; Track insurance adjusters
+(define-map authorized-adjusters principal bool)
+
+;; Track claims history per policy
+(define-map policy-claims-history
+    uint
+    (list 20 uint)
+)
+
+;; Track property insurance coverage
+(define-map property-coverage-tracker
+    (string-ascii 100)
+    {
+        active-policies: (list 5 uint),
+        total-coverage: uint,
+        claim-count: uint
+    }
+)
+
+;; Insurance premium pool
+(define-data-var insurance-premium-pool uint u0)
+
+;; Register as an authorized insurance adjuster
+(define-public (register-insurance-adjuster)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+        (ok (map-set authorized-adjusters tx-sender true))
+    )
+)
+
+;; Create a property insurance policy
+(define-public (create-insurance-policy
+    (property-address (string-ascii 100))
+    (coverage-amount uint)
+    (premium-amount uint)
+    (policy-duration uint)
+    (coverage-type (string-ascii 50))
+    (deductible uint))
+    (let
+        ((new-policy-id (+ (var-get last-insurance-id) u1))
+         (current-time stacks-block-height)
+         (policy-end (+ current-time policy-duration)))
+        
+        (asserts! (> coverage-amount u0) err-invalid-amount)
+        (asserts! (> premium-amount u0) err-invalid-amount)
+        (asserts! (<= coverage-amount MAX-CLAIM-AMOUNT) err-invalid-claim-amount)
+        (asserts! (> policy-duration u0) err-invalid-amount)
+        (asserts! (> deductible u0) err-invalid-amount)
+        
+        ;; Transfer premium to contract
+        (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+        
+        ;; Create insurance policy
+        (map-set property-insurance-policies new-policy-id
+            {
+                policy-holder: tx-sender,
+                property-address: property-address,
+                coverage-amount: coverage-amount,
+                premium-amount: premium-amount,
+                policy-start: current-time,
+                policy-end: policy-end,
+                status: "active",
+                coverage-type: coverage-type,
+                deductible: deductible,
+                total-claims-paid: u0
+            }
+        )
+        
+        ;; Update property coverage tracker
+        (match (map-get? property-coverage-tracker property-address)
+            existing-coverage
+                (map-set property-coverage-tracker property-address
+                    {
+                        active-policies: (unwrap-panic (as-max-len? (concat (get active-policies existing-coverage) (list new-policy-id)) u5)),
+                        total-coverage: (+ (get total-coverage existing-coverage) coverage-amount),
+                        claim-count: (get claim-count existing-coverage)
+                    }
+                )
+            (map-set property-coverage-tracker property-address
+                {
+                    active-policies: (list new-policy-id),
+                    total-coverage: coverage-amount,
+                    claim-count: u0
+                }
+            )
+        )
+        
+        ;; Add to premium pool
+        (var-set insurance-premium-pool (+ (var-get insurance-premium-pool) premium-amount))
+        (var-set last-insurance-id new-policy-id)
+        (ok new-policy-id)
+    )
+)
+
+;; File a damage claim
+(define-public (file-damage-claim
+    (policy-id uint)
+    (damage-description (string-ascii 500))
+    (claimed-amount uint)
+    (evidence-hash (string-ascii 64)))
+    (let
+        ((policy (unwrap! (map-get? property-insurance-policies policy-id) err-insurance-not-found))
+         (new-claim-id (+ (var-get last-claim-id) u1))
+         (current-time stacks-block-height)
+         (review-deadline (+ current-time CLAIM-REVIEW-PERIOD)))
+        
+        (asserts! (is-eq tx-sender (get policy-holder policy)) err-not-authorized)
+        (asserts! (is-eq (get status policy) "active") err-insurance-expired)
+        (asserts! (<= current-time (get policy-end policy)) err-insurance-expired)
+        (asserts! (> claimed-amount u0) err-invalid-claim-amount)
+        (asserts! (<= claimed-amount (get coverage-amount policy)) err-insufficient-coverage)
+        (asserts! (>= claimed-amount (get deductible policy)) err-invalid-claim-amount)
+        
+        ;; Create damage claim
+        (map-set damage-claims new-claim-id
+            {
+                claim-id: new-claim-id,
+                policy-id: policy-id,
+                claimant: tx-sender,
+                damage-description: damage-description,
+                claimed-amount: claimed-amount,
+                evidence-hash: evidence-hash,
+                claim-date: current-time,
+                review-deadline: review-deadline,
+                adjuster: none,
+                approved-amount: u0,
+                claim-status: "pending",
+                resolution-notes: ""
+            }
+        )
+        
+        ;; Update claims history for policy
+        (match (map-get? policy-claims-history policy-id)
+            existing-history 
+                (map-set policy-claims-history policy-id
+                    (unwrap-panic (as-max-len? (concat existing-history (list new-claim-id)) u20))
+                )
+            (map-set policy-claims-history policy-id (list new-claim-id))
+        )
+        
+        (var-set last-claim-id new-claim-id)
+        (ok new-claim-id)
+    )
+)
+
+;; Assign adjuster to claim
+(define-public (assign-claim-adjuster (claim-id uint) (adjuster principal))
+    (let
+        ((claim (unwrap! (map-get? damage-claims claim-id) err-claim-not-found)))
+        
+        (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+        (asserts! (is-some (map-get? authorized-adjusters adjuster)) err-unauthorized-adjuster)
+        (asserts! (is-eq (get claim-status claim) "pending") err-claim-already-processed)
+        
+        (ok (map-set damage-claims claim-id
+            (merge claim {
+                adjuster: (some adjuster),
+                claim-status: "under-review"
+            })
+        ))
+    )
+)
+
+;; Process insurance claim
+(define-public (process-insurance-claim
+    (claim-id uint)
+    (approved-amount uint)
+    (resolution-notes (string-ascii 300)))
+    (let
+        ((claim (unwrap! (map-get? damage-claims claim-id) err-claim-not-found))
+         (policy (unwrap! (map-get? property-insurance-policies (get policy-id claim)) err-insurance-not-found))
+         (current-time stacks-block-height))
+        
+        (asserts! (is-eq tx-sender (unwrap! (get adjuster claim) err-unauthorized-adjuster)) err-unauthorized-adjuster)
+        (asserts! (is-eq (get claim-status claim) "under-review") err-claim-already-processed)
+        (asserts! (<= current-time (get review-deadline claim)) err-claim-expired)
+        (asserts! (<= approved-amount (get claimed-amount claim)) err-invalid-claim-amount)
+        
+        ;; Process approved claim
+        (if (> approved-amount u0)
+            (begin
+                ;; Calculate fee and net payout
+                (let
+                    ((insurance-fee (/ (* approved-amount INSURANCE-FEE-RATE) u10000))
+                     (net-payout (- approved-amount insurance-fee)))
+                    
+                    ;; Transfer payout to claimant
+                    (try! (as-contract (stx-transfer? net-payout tx-sender (get claimant claim))))
+                    
+                    ;; Update policy total claims paid
+                    (map-set property-insurance-policies (get policy-id claim)
+                        (merge policy {
+                            total-claims-paid: (+ (get total-claims-paid policy) approved-amount)
+                        })
+                    )
+                    
+                    ;; Update property coverage tracker
+                    (match (map-get? property-coverage-tracker (get property-address policy))
+                        coverage-info
+                            (map-set property-coverage-tracker (get property-address policy)
+                                (merge coverage-info {
+                                    claim-count: (+ (get claim-count coverage-info) u1)
+                                })
+                            )
+                        true
+                    )
+                )
+            )
+            true
+        )
+        
+        ;; Update claim status
+        (map-set damage-claims claim-id
+            (merge claim {
+                approved-amount: approved-amount,
+                claim-status: (if (> approved-amount u0) "approved" "denied"),
+                resolution-notes: resolution-notes
+            })
+        )
+        
+        (ok approved-amount)
+    )
+)
+
+;; Renew insurance policy
+(define-public (renew-insurance-policy
+    (policy-id uint)
+    (new-premium-amount uint)
+    (extension-duration uint))
+    (let
+        ((policy (unwrap! (map-get? property-insurance-policies policy-id) err-insurance-not-found))
+         (current-time stacks-block-height))
+        
+        (asserts! (is-eq tx-sender (get policy-holder policy)) err-not-authorized)
+        (asserts! (is-eq (get status policy) "active") err-insurance-expired)
+        (asserts! (> new-premium-amount u0) err-invalid-amount)
+        (asserts! (> extension-duration u0) err-invalid-amount)
+        
+        ;; Transfer renewal premium
+        (try! (stx-transfer? new-premium-amount tx-sender (as-contract tx-sender)))
+        
+        ;; Update policy
+        (map-set property-insurance-policies policy-id
+            (merge policy {
+                policy-end: (+ (get policy-end policy) extension-duration),
+                premium-amount: (+ (get premium-amount policy) new-premium-amount)
+            })
+        )
+        
+        ;; Update premium pool
+        (var-set insurance-premium-pool (+ (var-get insurance-premium-pool) new-premium-amount))
+        (ok true)
+    )
+)
+
+;; Cancel insurance policy
+(define-public (cancel-insurance-policy (policy-id uint))
+    (let
+        ((policy (unwrap! (map-get? property-insurance-policies policy-id) err-insurance-not-found)))
+        
+        (asserts! (is-eq tx-sender (get policy-holder policy)) err-not-authorized)
+        (asserts! (is-eq (get status policy) "active") err-insurance-expired)
+        
+        (ok (map-set property-insurance-policies policy-id
+            (merge policy {
+                status: "cancelled"
+            })
+        ))
+    )
+)
+
+;; Read-only functions for insurance system
+
+(define-read-only (get-insurance-policy (policy-id uint))
+    (ok (map-get? property-insurance-policies policy-id))
+)
+
+(define-read-only (get-damage-claim (claim-id uint))
+    (ok (map-get? damage-claims claim-id))
+)
+
+(define-read-only (get-property-coverage (property-address (string-ascii 100)))
+    (ok (map-get? property-coverage-tracker property-address))
+)
+
+(define-read-only (get-policy-claims-history (policy-id uint))
+    (ok (map-get? policy-claims-history policy-id))
+)
+
+(define-read-only (get-insurance-premium-pool)
+    (ok (var-get insurance-premium-pool))
+)
+
+(define-read-only (is-policy-active (policy-id uint))
+    (match (map-get? property-insurance-policies policy-id)
+        policy (ok (and 
+            (is-eq (get status policy) "active")
+            (<= stacks-block-height (get policy-end policy))
+        ))
+        (ok false)
+    )
+)
+
+(define-read-only (calculate-claim-coverage-ratio (policy-id uint))
+    (match (map-get? property-insurance-policies policy-id)
+        policy (ok (/ (* (get total-claims-paid policy) u100) (get coverage-amount policy)))
+        (ok u0)
+    )
+)
+
+(define-read-only (get-last-insurance-id)
+    (ok (var-get last-insurance-id))
+)
+
+(define-read-only (get-last-claim-id)
+    (ok (var-get last-claim-id))
+)
+
+(define-read-only (is-authorized-adjuster (adjuster principal))
+    (ok (default-to false (map-get? authorized-adjusters adjuster)))
+)
+
+
+
